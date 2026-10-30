@@ -1,46 +1,227 @@
 <!DOCTYPE html>
-<!--
-  index.html — THE FRONTEND.
-  Knows nothing about pipes, FIFOs, or system calls. It only calls two
-  addresses the backend exposes: GET /messages and POST /send. All real
-  Linux IPC work lives in ../backend/server.py.
--->
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Relay</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Linux IPC: Named & Unnamed Pipes</title>
+
+  <!-- Clean, readable fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div class="app">
-    <header>
-      <span class="wordmark">Relay</span>
-      <div class="status">
-        <span id="dot" class="dot"></span>
-        <span id="statusText">Connecting</span>
-      </div>
-    </header>
 
-    <div id="chat" class="chat">
-      <div id="empty" class="empty">
-        <p>No messages yet.</p>
-        <p class="empty-sub">Say something — it travels through a live pipe to the other window.</p>
+  <!-- Navigation Bar -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="brand-badge">IPC</div>
+      <div>
+        <h1 class="brand-title">Linux IPC Demonstrator</h1>
+        <p class="brand-sub">Operating Systems · Team 20 (Course 25CS2104E)</p>
       </div>
     </div>
 
-    <form id="messageForm" class="composer">
-      <input id="messageBox" autocomplete="off" placeholder="Message" disabled>
-      <button id="sendBtn" type="submit" disabled aria-label="Send">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-          <path d="M4 12L20 4L13 20L11 13L4 12Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-        </svg>
+    <!-- Mode Switcher -->
+    <div class="mode-tabs">
+      <button id="tabNamed" class="tab-btn active" onclick="switchMode('named')">
+        <span class="icon">💬</span>
+        <span>Named Pipes (WhatsApp 2-Way)</span>
       </button>
-    </form>
-  </div>
+      <button id="tabUnnamed" class="tab-btn" onclick="switchMode('unnamed')">
+        <span class="icon">⚡</span>
+        <span>Unnamed Pipes (Parent &rarr; Child)</span>
+      </button>
+    </div>
+
+    <!-- Status indicator -->
+    <div class="connection-pill" id="connPill">
+      <span class="conn-dot" id="connDot"></span>
+      <span id="connStatus">Connecting...</span>
+    </div>
+  </header>
+
+  <main class="content-wrapper">
+
+    <!-- ============================================================= -->
+    <!-- OPTION 1: NAMED PIPES (WHATSAPP-STYLE TWO-WAY CHAT)          -->
+    <!-- ============================================================= -->
+    <section id="viewNamed" class="ipc-view active">
+      <div class="view-header">
+        <div>
+          <h2>Named Pipes (FIFO) Two-Way Communication</h2>
+          <p>Two separate processes chat in real time using two named pipes in <code>/tmp</code> (<code>/tmp/relay_a_to_b</code> and <code>/tmp/relay_b_to_a</code>). Every message is printed in the backend terminal.</p>
+        </div>
+      </div>
+
+      <div class="whatsapp-layout">
+        <!-- WhatsApp Chat Window -->
+        <div class="wa-container">
+          <!-- WhatsApp Top Bar -->
+          <div class="wa-topbar">
+            <div class="wa-avatar">
+              <span id="peerAvatarInitial">B</span>
+            </div>
+            <div class="wa-peer-info">
+              <div class="wa-peer-name" id="waPeerName">User B</div>
+              <div class="wa-peer-status" id="waPeerStatus">waiting for connection...</div>
+            </div>
+            <div class="wa-ipc-tag">
+              <span class="fifo-file-tag">mkfifo()</span>
+            </div>
+          </div>
+
+          <!-- Chat Messages Body -->
+          <div class="wa-messages" id="chatArea">
+            <div class="wa-banner">
+              🔒 End-to-end Linux IPC via FIFOs in <code>/tmp</code>. Open User A on port 5001 and User B on port 5002.
+            </div>
+            <div class="empty-chat" id="emptyChatNotice">
+              <p>No messages exchanged yet.</p>
+              <span>Type below to send a live message through the named pipe!</span>
+            </div>
+          </div>
+
+          <!-- Live Syscall Tracker Bar -->
+          <div class="syscall-live-dock">
+            <span class="dock-label">TERMINAL IPC:</span>
+            <span class="dock-code" id="syscallDockText">Ready. Run ./server A 5001 and ./server B 5002 in terminals.</span>
+          </div>
+
+          <!-- WhatsApp Composer Bar -->
+          <form id="chatForm" class="wa-composer">
+            <input type="text" id="chatInput" placeholder="Type a message to send through Linux FIFO..." autocomplete="off">
+            <button type="submit" id="sendBtn" class="wa-send-btn" title="Send (Enter)">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </form>
+        </div>
+
+        <!-- Explanatory Info Card (Viva Ready) -->
+        <div class="info-sidebar">
+          <div class="card info-card">
+            <h3>How Named Pipes Work</h3>
+            <ul class="info-list">
+              <li>
+                <strong>Filesystem Presence:</strong>
+                <p>Created with <code>mkfifo("/tmp/relay_a_to_b", 0666)</code>. Both independent programs open this same file path.</p>
+              </li>
+              <li>
+                <strong>Blocking Synchronization:</strong>
+                <p><code>open(O_WRONLY)</code> blocks until the other process opens <code>O_RDONLY</code>. No sockets or networks are needed!</p>
+              </li>
+              <li>
+                <strong>Two-Way Communication:</strong>
+                <p>A FIFO is unidirectional. Two FIFOs (A&rarr;B and B&rarr;A) enable full-duplex two-way chatting.</p>
+              </li>
+              <li>
+                <strong>Check Terminal:</strong>
+                <p>Look at your terminal running <code>./server</code> to see real-time <code>[FIFO SEND]</code> and <code>[FIFO RECV]</code> logs!</p>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- OPTION 2: UNNAMED PIPES (PARENT INPUTS -> FORK CHILD)         -->
+    <!-- ============================================================= -->
+    <section id="viewUnnamed" class="ipc-view">
+      <div class="view-header">
+        <div>
+          <h2>Unnamed Pipes: Parent Input &rarr; Fork Child</h2>
+          <p>Give inputs to the Parent process <strong>before</strong> creating the child. The bytes wait in the Linux kernel pipe buffer. When you click <strong>Fork Child</strong>, the child process is created and receives all parent inputs!</p>
+        </div>
+        <button class="btn-outline" onclick="resetUnnamedPipe()">🔄 Reset / New Pipe</button>
+      </div>
+
+      <div class="unnamed-flow-grid">
+        <!-- Step 1: Parent Process Box (Input Stage) -->
+        <div class="card flow-card" id="cardParent">
+          <div class="flow-card-header">
+            <div class="step-badge">Phase 1</div>
+            <h3>Parent Process (Input Stage)</h3>
+            <span class="pid-badge" id="parentPidDisplay">PID: Initializing...</span>
+          </div>
+
+          <p class="flow-desc">Give inputs to the Parent process. All inputs are written to <code>pipefd[1]</code> and stored in kernel memory. <strong>The child does not exist yet!</strong></p>
+
+          <!-- Input submission for Parent -->
+          <form id="parentInputForm" class="parent-input-bar">
+            <input type="text" id="parentInputText" placeholder="Enter input for Parent (e.g., Task 1, Student data, Message)..." autocomplete="off">
+            <button type="submit" class="btn-parent-add">
+              <span>+ Add Input to Parent</span>
+            </button>
+          </form>
+
+          <!-- List of inputs queued in Parent -->
+          <div class="queued-inputs-box">
+            <div class="box-title">Inputs Queued in Parent Pipe Buffer (<span id="queuedCount">0</span>):</div>
+            <div class="queued-items-list" id="queuedItemsList">
+              <div class="empty-queue-msg" id="emptyQueueMsg">No inputs added to Parent yet. Type an input above and click Add!</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Step 2: Fork Action & Central Pipe -->
+        <div class="card fork-action-card">
+          <div class="pipe-icon-center">
+            <div class="pipe-tube">
+              <span class="pipe-tube-label">Linux Kernel Circular Buffer (RAM)</span>
+              <span class="pipe-status-text" id="pipeBufferStatus">Buffer waiting for inputs...</span>
+            </div>
+          </div>
+
+          <div class="fork-btn-container">
+            <button id="btnForkChild" class="btn-fork" onclick="triggerForkChild()" disabled>
+              <span class="fork-icon">🚀</span>
+              <span class="fork-text">Create Child Process (fork())</span>
+            </button>
+            <p class="fork-hint" id="forkHint">Add at least one input to the Parent above to enable fork().</p>
+          </div>
+        </div>
+
+        <!-- Step 3: Child Process Box (Receipt Stage) -->
+        <div class="card flow-card" id="cardChild">
+          <div class="flow-card-header">
+            <div class="step-badge step-child">Phase 2</div>
+            <h3>Child Process (Receives All Inputs)</h3>
+            <span class="pid-badge pid-child" id="childPidDisplay">Child not forked yet</span>
+          </div>
+
+          <p class="flow-desc" id="childStatusDesc">Waiting for Parent to trigger <code>fork()</code>. Once created, Child will read all queued inputs from <code>pipefd[0]</code>.</p>
+
+          <!-- List of inputs received by Child -->
+          <div class="received-inputs-box">
+            <div class="box-title">Inputs Received by Child from Pipe:</div>
+            <div class="received-items-list" id="receivedItemsList">
+              <div class="empty-child-msg" id="emptyChildMsg">Child has not been created yet.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Real Backend Terminal Trace Output -->
+      <div class="card terminal-card">
+        <div class="terminal-card-header">
+          <div class="term-dots">
+            <span class="dot-red"></span>
+            <span class="dot-yellow"></span>
+            <span class="dot-green"></span>
+          </div>
+          <span class="term-title">Backend Terminal Trace (What is printed on your server console)</span>
+        </div>
+        <pre class="terminal-body" id="termOutput">[Ready] Add inputs to the Parent process above. Check your terminal running ./server to see live OS output!</pre>
+      </div>
+    </section>
+
+  </main>
 
   <script src="/script.js"></script>
 </body>

@@ -50,6 +50,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -85,6 +86,18 @@ static volatile int peer_connected = 0;
 
 static const char *my_label;
 static const char *peer_label;
+static const char *active_write_path = "";
+static const char *active_read_path  = "";
+
+/* -------------------- UNNAMED PIPE SESSION STATE ------------------------
+ * Enables the user to give inputs to the Parent process BEFORE creating
+ * the child. When fork() is called, the child reads and receives all inputs.
+ * ----------------------------------------------------------------------- */
+#define MAX_UNNAMED_INPUTS 32
+static int   unnamed_pipefd[2] = {-1, -1};
+static char  unnamed_inputs[MAX_UNNAMED_INPUTS][MAX_TEXT_LEN];
+static int   unnamed_input_count = 0;
+static pthread_mutex_t unnamed_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Adds a message to the shared history. Thread-safe. */
 static void add_message(const char *from, const char *text)
@@ -117,7 +130,10 @@ static void *writer_thread(void *arg)
     if (fd == -1) { perror("writer open() failed"); return NULL; }
     writer_fd = fd;
     peer_connected = 1;
-    printf("[connected] The other backend opened the pipe. You can chat now.\n");
+    printf("\n============================================================\n");
+    printf("[FIFO CONNECTED] %s connected to %s!\n", my_label, peer_label);
+    printf("[FIFO CONNECTED] Opened %s (Write FD: %d)\n", path, fd);
+    printf("============================================================\n");
     fflush(stdout);
     return NULL;
 }
@@ -153,7 +169,8 @@ static void *reader_thread(void *arg)
             for (size_t i = 0; i < buf_len; i++) {
                 if (buf[i] == '\0') {
                     add_message("peer", buf + start);
-                    printf("[recv] %s\n", buf + start);
+                    printf("\n[FIFO RECV] << Message arrived from %s (via %s):\n", peer_label, path);
+                    printf("             \"%s\"\n", buf + start);
                     fflush(stdout);
                     start = i + 1;
                 }
@@ -267,14 +284,246 @@ static void send_response(int client, int code, const char *content_type,
 static void serve_file(int client, const char *relative_path, const char *content_type)
 {
     char full_path[512];
-    snprintf(full_path, sizeof(full_path), "%s%s", FRONTEND_DIR, relative_path);
-
+    snprintf(full_path, sizeof(full_path), "../Frontend%s", relative_path);
     size_t len = 0;
     char *data = read_file(full_path, &len);
+    if (!data) {
+        snprintf(full_path, sizeof(full_path), "../frontend%s", relative_path);
+        data = read_file(full_path, &len);
+    }
+    if (!data) {
+        snprintf(full_path, sizeof(full_path), "./Frontend%s", relative_path);
+        data = read_file(full_path, &len);
+    }
+    if (!data) {
+        snprintf(full_path, sizeof(full_path), "./frontend%s", relative_path);
+        data = read_file(full_path, &len);
+    }
     if (!data) { send_response(client, 404, "text/plain", "Not found", 9); return; }
 
     send_response(client, 200, content_type, data, len);
     free(data);
+}
+
+/* ==========================================================================
+ *  UNNAMED PIPES IMPLEMENTATION (pipe() + fork())
+ *  1. User gives inputs to Parent process BEFORE child is created.
+ *     Inputs are written to pipefd[1] and sit in the Linux kernel pipe buffer.
+ *  2. User triggers fork().
+ *  3. Child process reads and receives ALL queued inputs from pipefd[0].
+ *  4. Full traces are printed in the backend terminal!
+ * ========================================================================== */
+
+static void handle_unnamed_input(int client, const char *request_body)
+{
+    char text[MAX_TEXT_LEN];
+    extract_text_field(request_body, text, sizeof(text));
+
+    if (text[0] == '\0') {
+        send_response(client, 400, "application/json", "{\"error\":\"Empty input text\"}", 28);
+        return;
+    }
+
+    pthread_mutex_lock(&unnamed_lock);
+
+    /* Allocate the unnamed pipe if not already open */
+    if (unnamed_pipefd[0] == -1) {
+        if (pipe(unnamed_pipefd) == -1) {
+            pthread_mutex_unlock(&unnamed_lock);
+            perror("pipe creation failed");
+            send_response(client, 500, "application/json", "{\"error\":\"pipe creation failed\"}", 32);
+            return;
+        }
+        printf("\n============================================================\n");
+        printf("[UNNAMED PIPE - PARENT (PID %d)] pipe(fd) called by Parent!\n", getpid());
+        printf("[UNNAMED PIPE - PARENT (PID %d)] Allocated Read fd[0]=%d, Write fd[1]=%d\n",
+               getpid(), unnamed_pipefd[0], unnamed_pipefd[1]);
+        printf("[UNNAMED PIPE - PARENT (PID %d)] Kernel circular buffer allocated in RAM.\n", getpid());
+        printf("============================================================\n");
+        fflush(stdout);
+    }
+
+    if (unnamed_input_count >= MAX_UNNAMED_INPUTS) {
+        pthread_mutex_unlock(&unnamed_lock);
+        send_response(client, 400, "application/json", "{\"error\":\"Input queue full\"}", 26);
+        return;
+    }
+
+    /* Write input into pipefd[1] with null byte delimiter */
+    write(unnamed_pipefd[1], text, strlen(text));
+    write(unnamed_pipefd[1], "\0", 1);
+
+    snprintf(unnamed_inputs[unnamed_input_count], sizeof(unnamed_inputs[0]), "%s", text);
+    unnamed_input_count++;
+
+    printf("[UNNAMED PIPE - PARENT (PID %d)] Queued Input #%d: \"%s\"\n",
+           getpid(), unnamed_input_count, text);
+    printf("                                -> Written to pipefd[1]=%d (stored in kernel buffer)\n", unnamed_pipefd[1]);
+    printf("                                -> NOTE: Child process does NOT exist yet!\n");
+    fflush(stdout);
+
+    /* Build JSON response containing all currently queued inputs */
+    char body[4096];
+    size_t pos = 0;
+    pos += snprintf(body + pos, sizeof(body) - pos,
+        "{\"status\":\"queued\",\"parent_pid\":%d,\"count\":%d,\"input\":\"%s\",\"inputs\":[",
+        getpid(), unnamed_input_count, text);
+    for (int i = 0; i < unnamed_input_count; i++) {
+        char esc[MAX_TEXT_LEN * 2];
+        json_escape(unnamed_inputs[i], esc, sizeof(esc));
+        pos += snprintf(body + pos, sizeof(body) - pos, "%s\"%s\"", (i == 0 ? "" : ","), esc);
+    }
+    pos += snprintf(body + pos, sizeof(body) - pos, "]}");
+
+    pthread_mutex_unlock(&unnamed_lock);
+    send_response(client, 200, "application/json", body, pos);
+}
+
+static void handle_unnamed_fork(int client)
+{
+    pthread_mutex_lock(&unnamed_lock);
+
+    if (unnamed_input_count == 0 || unnamed_pipefd[0] == -1) {
+        pthread_mutex_unlock(&unnamed_lock);
+        send_response(client, 400, "application/json",
+            "{\"error\":\"No inputs given to Parent yet! Please add at least 1 input before creating child.\"}", 94);
+        return;
+    }
+
+    printf("\n============================================================\n");
+    printf("[UNNAMED PIPE - FORK INITIATED]\n");
+    printf("[UNNAMED PIPE - PARENT (PID %d)] Inputs queued in pipe before fork: %d\n",
+           getpid(), unnamed_input_count);
+    printf("[UNNAMED PIPE - PARENT (PID %d)] Calling fork() to create Child process...\n", getpid());
+    printf("============================================================\n");
+    fflush(stdout);
+
+    /* Pipe used to pass child's read confirmation back to parent for HTTP response */
+    int c2p[2];
+    if (pipe(c2p) == -1) {
+        pthread_mutex_unlock(&unnamed_lock);
+        send_response(client, 500, "application/json", "{\"error\":\"feedback pipe failed\"}", 32);
+        return;
+    }
+
+    pid_t child_pid = fork();
+
+    if (child_pid < 0) {
+        pthread_mutex_unlock(&unnamed_lock);
+        perror("fork failed");
+        send_response(client, 500, "application/json", "{\"error\":\"fork() failed\"}", 24);
+        return;
+    }
+
+    if (child_pid == 0) {
+        /* ----------------------- CHILD PROCESS ----------------------- */
+        close(unnamed_pipefd[1]);  /* Close parent's write end in child */
+        close(c2p[0]);             /* Close child-to-parent read end    */
+
+        printf("\n[UNNAMED PIPE - CHILD (PID %d)] CREATED via fork() from Parent (PPID: %d)!\n",
+               getpid(), getppid());
+        printf("[UNNAMED PIPE - CHILD (PID %d)] Closed unused write end fd[1]=%d\n",
+               getpid(), unnamed_pipefd[1]);
+        printf("[UNNAMED PIPE - CHILD (PID %d)] Now reading all inputs from pipefd[0]=%d...\n",
+               getpid(), unnamed_pipefd[0]);
+        fflush(stdout);
+
+        char chunk[READ_CHUNK];
+        char read_buf[4096];
+        size_t read_len = 0;
+        int received_count = 0;
+
+        while (1) {
+            ssize_t n = read(unnamed_pipefd[0], chunk, sizeof(chunk));
+            if (n <= 0) break; /* 0 = EOF */
+
+            if (read_len + (size_t)n > sizeof(read_buf)) break;
+            memcpy(read_buf + read_len, chunk, (size_t)n);
+            read_len += (size_t)n;
+
+            size_t start = 0;
+            for (size_t i = 0; i < read_len; i++) {
+                if (read_buf[i] == '\0') {
+                    received_count++;
+                    printf("[UNNAMED PIPE - CHILD (PID %d)] >> RECEIVED INPUT #%d: \"%s\"\n",
+                           getpid(), received_count, read_buf + start);
+                    fflush(stdout);
+                    start = i + 1;
+                }
+            }
+            size_t rem = read_len - start;
+            memmove(read_buf, read_buf + start, rem);
+            read_len = rem;
+        }
+
+        printf("[UNNAMED PIPE - CHILD (PID %d)] Reached EOF on pipefd[0]. Total inputs received: %d.\n",
+               getpid(), received_count);
+        printf("[UNNAMED PIPE - CHILD (PID %d)] All parent inputs processed cleanly. Child exiting.\n", getpid());
+        fflush(stdout);
+
+        /* Send count confirmation to parent */
+        write(c2p[1], &received_count, sizeof(int));
+        close(unnamed_pipefd[0]);
+        close(c2p[1]);
+        _exit(0);
+
+    } else {
+        /* ----------------------- PARENT PROCESS ----------------------- */
+        close(unnamed_pipefd[1]);  /* Close write end in parent so child receives EOF */
+        close(c2p[1]);             /* Close write end of feedback pipe */
+
+        int child_recv_count = 0;
+        read(c2p[0], &child_recv_count, sizeof(int));
+        close(c2p[0]);
+
+        int status = 0;
+        waitpid(child_pid, &status, 0);
+
+        printf("\n[UNNAMED PIPE - PARENT (PID %d)] waitpid() collected Child (PID: %d). Exit code: %d\n",
+               getpid(), (int)child_pid, WEXITSTATUS(status));
+        printf("[UNNAMED PIPE - PARENT (PID %d)] Communication complete! Pipe buffer destroyed.\n", getpid());
+        printf("============================================================\n\n");
+        fflush(stdout);
+
+        /* Build JSON response */
+        char body[8192];
+        size_t pos = 0;
+        pos += snprintf(body + pos, sizeof(body) - pos,
+            "{\"success\":true,\"parent_pid\":%d,\"child_pid\":%d,\"count\":%d,\"inputs\":[",
+            getpid(), (int)child_pid, unnamed_input_count);
+        for (int i = 0; i < unnamed_input_count; i++) {
+            char esc[MAX_TEXT_LEN * 2];
+            json_escape(unnamed_inputs[i], esc, sizeof(esc));
+            pos += snprintf(body + pos, sizeof(body) - pos, "%s\"%s\"", (i == 0 ? "" : ","), esc);
+        }
+        pos += snprintf(body + pos, sizeof(body) - pos, "]}");
+
+        /* Reset state for next unnamed pipe demo */
+        close(unnamed_pipefd[0]);
+        unnamed_pipefd[0] = -1;
+        unnamed_pipefd[1] = -1;
+        unnamed_input_count = 0;
+
+        pthread_mutex_unlock(&unnamed_lock);
+        send_response(client, 200, "application/json", body, pos);
+    }
+}
+
+static void handle_unnamed_reset(int client)
+{
+    pthread_mutex_lock(&unnamed_lock);
+    if (unnamed_pipefd[0] != -1) {
+        close(unnamed_pipefd[0]);
+        close(unnamed_pipefd[1]);
+        unnamed_pipefd[0] = -1;
+        unnamed_pipefd[1] = -1;
+    }
+    unnamed_input_count = 0;
+    printf("[UNNAMED PIPE] State reset. Ready for new inputs.\n");
+    fflush(stdout);
+    pthread_mutex_unlock(&unnamed_lock);
+
+    send_response(client, 200, "application/json", "{\"status\":\"reset\"}", 18);
 }
 
 static void handle_messages(int client, const char *query)
@@ -312,19 +561,20 @@ static void handle_send(int client, const char *request_body)
     extract_text_field(request_body, text, sizeof(text));
 
     if (text[0] != '\0' && writer_fd != -1) {
-        /* THE REAL IPC CALL - everything above exists just to get here. */
+        /* THE REAL IPC CALL - writes null-terminated string to FIFO */
         write(writer_fd, text, strlen(text));
         write(writer_fd, "\0", 1);
         add_message("me", text);
-        printf("[send] sent: %s\n", text);
+        printf("\n[FIFO SEND] >> %s sent message: \"%s\"\n", my_label, text);
+        printf("            Written to named pipe: %s\n", active_write_path);
         fflush(stdout);
         send_response(client, 200, "text/plain", "", 0);
     } else if (text[0] == '\0') {
-        printf("[send] ignored: no text found in request body\n");
+        printf("[FIFO SEND] ignored: empty text\n");
         fflush(stdout);
         send_response(client, 503, "text/plain", "", 0);
     } else {
-        printf("[send] blocked: peer has not connected yet\n");
+        printf("[FIFO SEND] blocked: %s has not connected yet via %s\n", peer_label, active_write_path);
         fflush(stdout);
         send_response(client, 503, "text/plain", "", 0);
     }
@@ -392,16 +642,27 @@ static void *handle_client(void *arg)
     if (query) { *query = '\0'; query++; }
 
     if (strcmp(method, "GET") == 0) {
-        if      (strcmp(path, "/") == 0)          serve_file(client, "/index.html", "text/html");
-        else if (strcmp(path, "/style.css") == 0) serve_file(client, "/style.css", "text/css");
-        else if (strcmp(path, "/script.js") == 0) serve_file(client, "/script.js", "application/javascript");
-        else if (strcmp(path, "/messages") == 0)  handle_messages(client, query);
+        if      (strcmp(path, "/") == 0)             serve_file(client, "/index.html", "text/html");
+        else if (strcmp(path, "/style.css") == 0)    serve_file(client, "/style.css", "text/css");
+        else if (strcmp(path, "/script.js") == 0)    serve_file(client, "/script.js", "application/javascript");
+        else if (strcmp(path, "/messages") == 0)     handle_messages(client, query);
         else send_response(client, 404, "text/plain", "Not found", 9);
 
-    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/send") == 0) {
-        /* find the blank line that separates headers from the body */
+    } else if (strcmp(method, "POST") == 0) {
         char *body = strstr(request, "\r\n\r\n");
-        handle_send(client, body ? body + 4 : "");
+        const char *payload = body ? body + 4 : "";
+
+        if (strcmp(path, "/send") == 0) {
+            handle_send(client, payload);
+        } else if (strcmp(path, "/unnamed/input") == 0) {
+            handle_unnamed_input(client, payload);
+        } else if (strcmp(path, "/unnamed/fork") == 0) {
+            handle_unnamed_fork(client);
+        } else if (strcmp(path, "/unnamed/reset") == 0) {
+            handle_unnamed_reset(client);
+        } else {
+            send_response(client, 404, "text/plain", "Not found", 9);
+        }
 
     } else if (strcmp(method, "OPTIONS") == 0) {
         send_response(client, 200, "text/plain", "", 0);
@@ -438,11 +699,13 @@ int main(int argc, char *argv[])
     const char *write_path, *read_path;
     if (strcmp(role, "A") == 0) {
         write_path = FIFO_A_TO_B; read_path = FIFO_B_TO_A;
-        my_label = "You (User A)"; peer_label = "User B";
+        my_label = "User A"; peer_label = "User B";
     } else {
         write_path = FIFO_B_TO_A; read_path = FIFO_A_TO_B;
-        my_label = "You (User B)"; peer_label = "User A";
+        my_label = "User B"; peer_label = "User A";
     }
+    active_write_path = write_path;
+    active_read_path = read_path;
 
     /* ---------- start the two background IPC threads ---------- */
     pthread_t wt, rt;
